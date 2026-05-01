@@ -43,7 +43,7 @@ def get_client() -> Groq:
                 api_key = os.environ.get("GROQ_API_KEY", "")
                 if not api_key:
                     raise RuntimeError("GROQ_API_KEY environment variable is not set")
-                _client = Groq(api_key=api_key)
+                _client = Groq(api_key=api_key )
     return _client
 
 
@@ -247,13 +247,29 @@ def run_pipeline(
     pipeline_start = time.time()
     category_rules = get_category_rules(category)
 
+    # Flatten nested judge payload structure: {identity:{}, performance:{}, offers:[]}
+    # into a single dict so prompts can reference any field directly
+    def flatten_payload(p: dict) -> dict:
+        flat = {}
+        for k, v in p.items():
+            if isinstance(v, dict):
+                flat.update(v)       # hoist nested keys to top level
+                flat[k] = v          # also keep original nested key
+            else:
+                flat[k] = v
+        return flat
+
+    merchant_flat = flatten_payload(merchant_payload)
+    trigger_flat = flatten_payload(trigger_payload)
+    customer_flat = flatten_payload(customer_payload) if customer_payload else {}
+
     merged_context = {
         "merchant_id": merchant_id,
         "trigger_id": trigger_id,
         "category": category,
-        "merchant": merchant_payload,
-        "trigger": trigger_payload,
-        "customer": customer_payload or {},
+        "merchant": merchant_flat,
+        "trigger": trigger_flat,
+        "customer": customer_flat,
         "tick_count": len(tick_history),
     }
 

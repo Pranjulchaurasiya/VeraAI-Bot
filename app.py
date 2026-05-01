@@ -152,6 +152,8 @@ def tick():
             merchant_payload.get("category")
             or merchant_payload.get("type")
             or merchant_payload.get("business_type")
+            or (merchant_payload.get("identity") or {}).get("category")
+            or (merchant_payload.get("identity") or {}).get("type")
             or "restaurant"
         ).lower()
 
@@ -294,6 +296,8 @@ def reply():
             merchant_payload.get("category")
             or merchant_payload.get("type")
             or merchant_payload.get("business_type")
+            or (merchant_payload.get("identity") or {}).get("category")
+            or (merchant_payload.get("identity") or {}).get("type")
             or "restaurant"
         ).lower()
 
