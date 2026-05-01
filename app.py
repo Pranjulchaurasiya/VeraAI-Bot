@@ -410,7 +410,7 @@ def _process_trigger(trigger_id: str, now: str) -> dict | None:
         conversation_id=conversation_id,
     )
     add_conversation_turn(conversation_id, "vera", message)
-    cache_last_message(merchant_id, {**action, "tick_id": tick_id})
+    cache_last_message(merchant_id, {**action, "tick_id": tick_id, "trigger_id": trigger_id})
 
     return action
 
@@ -483,21 +483,27 @@ def reply():
         # ── Get context ───────────────────────────────────────────
         merchant_payload = get_context("merchant", merchant_id) or {}
         category_slug = extract_category_slug(merchant_payload)
+        category_payload = get_context("category", category_slug) or {}
         conversation_history = get_last_turns(conversation_id, n=5)
         tick_history = get_merchant_tick_history(merchant_id, last_n=5)
 
-        # Get original message/CTA
+        # Get original message/CTA + trigger context
         tick_info = lookup_tick(conversation_id)
         original_message = ""
         original_cta = ""
+        trigger_payload = {}
         if tick_info:
             original_message = tick_info.get("message", "")
             original_cta = tick_info.get("cta", "")
+            trigger_id = tick_info.get("trigger_id", "")
+            trigger_payload = get_context("trigger", trigger_id) or {}
         else:
             cached = get_cached_message(merchant_id)
             if cached:
                 original_message = cached.get("body", "")
                 original_cta = cached.get("cta", "")
+                trigger_id = cached.get("trigger_id", "")
+                trigger_payload = get_context("trigger", trigger_id) or {} if trigger_id else {}
 
         # ── Run reply pipeline ────────────────────────────────────
         try:
@@ -510,6 +516,8 @@ def reply():
                 merchant_payload=merchant_payload,
                 tick_history=tick_history,
                 turn_number=turn_number,
+                trigger_payload=trigger_payload,
+                category_payload=category_payload,
             )
         except Exception as e:
             logger.error(f"Reply pipeline failed: {e}", exc_info=True)

@@ -283,6 +283,8 @@ def run_reply_pipeline(
     merchant_payload: dict,
     tick_history: list,
     turn_number: int = 1,
+    trigger_payload: dict | None = None,
+    category_payload: dict | None = None,
 ) -> dict:
     user_prompt = reply_composer_user(
         reply_text=reply_text,
@@ -293,6 +295,8 @@ def run_reply_pipeline(
         merchant_payload=merchant_payload,
         tick_history=tick_history,
         turn_number=turn_number,
+        trigger_payload=trigger_payload,
+        category_payload=category_payload,
     )
 
     try:

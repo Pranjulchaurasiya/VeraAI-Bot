@@ -276,11 +276,17 @@ Patterns: "Thank you for contacting", "Our team will respond", "I am currently u
 
 CASE YES — Positive intent ("yes", "go ahead", "ok", "haan", "kar do", "let's do it", "ok lets do it"):
 → IMMEDIATELY switch to action mode. DO NOT ask another qualifying question.
-→ Provide the concrete next step or drafted artifact.
+→ Provide the SPECIFIC concrete next step based on the trigger kind and merchant context.
+→ For research_digest: "Sending the abstract now. Also drafting the patient-ed WhatsApp..."
+→ For recall_due: "Booking confirmed for [slot]. See you then!"
+→ For perf_dip: "Running the recovery campaign now. Here's what I'm doing..."
+→ For supply_alert: "Pulling the affected customer list now. Drafting their WhatsApp note..."
+→ For active_planning_intent: Give the actual drafted artifact immediately.
 → action="send", mark_acted=true
 
 CASE NO — Not interested ("no", "nahi", "not now", "baad mein", "not interested"):
-→ Acknowledge gracefully. Offer ONE completely different angle.
+→ Acknowledge gracefully. Offer ONE completely different angle from the merchant's context.
+→ Reference a different signal or offer from their actual data.
 → action="send"
 
 CASE OFF_TOPIC — Unrelated question ("can you help with GST", "what's the weather", "who are you"):
@@ -297,11 +303,12 @@ CASE HANDOFF — Intent to involve someone else ("talk to my manager", "check wi
 
 ═══ TONE RULES ═══
 Match category: clinical for dentist/pharmacy, warm+Hinglish for restaurant/salon/gym.
-Under 80 words. Be human, not robotic.
+Use owner first name when available. Under 80 words. Be human, not robotic.
+Reference REAL facts from the merchant context — never invent offers or numbers.
 
 Return ONLY valid JSON:
 {
-  "message": "<response — empty string if action=end>",
+  "message": "<response — specific to trigger kind and merchant context>",
   "cta": "<cta or empty>",
   "send_as": "<vera|merchant_on_behalf|handoff>",
   "action": "<send|wait|end>",
@@ -322,6 +329,8 @@ def reply_composer_user(
     merchant_payload: dict,
     tick_history: list,
     turn_number: int = 1,
+    trigger_payload: dict | None = None,
+    category_payload: dict | None = None,
 ) -> str:
     history_summary = [
         {"tick_num": t["tick_num"], "signal": t["signal"], "acted": t["acted"]}
@@ -334,14 +343,55 @@ def reply_composer_user(
         if t.get("role") not in ("vera", "merchant_on_behalf")
     ]
 
+    # Extract key merchant facts for grounding the reply
+    identity = merchant_payload.get("identity", {})
+    owner_name = identity.get("owner_first_name", "")
+    merchant_name = identity.get("name", "")
+    active_offers = [o.get("title") for o in merchant_payload.get("offers", []) if o.get("status") == "active"]
+    signals = merchant_payload.get("signals", [])
+
+    # Extract trigger kind for context-aware YES response
+    trigger_kind = ""
+    trigger_summary = {}
+    if trigger_payload:
+        trigger_kind = trigger_payload.get("kind", "")
+        trigger_inner = trigger_payload.get("payload", {})
+        trigger_summary = {
+            "kind": trigger_kind,
+            "urgency": trigger_payload.get("urgency"),
+            "suppression_key": trigger_payload.get("suppression_key"),
+            "payload": trigger_inner,
+        }
+
+    # Extract relevant digest item if research trigger
+    digest_item = {}
+    if category_payload and trigger_payload:
+        top_item_id = (trigger_payload.get("payload") or {}).get("top_item_id")
+        if top_item_id:
+            for d in category_payload.get("digest", []):
+                if d.get("id") == top_item_id:
+                    digest_item = d
+                    break
+
+    merchant_summary = {
+        "owner_first_name": owner_name,
+        "merchant_name": merchant_name,
+        "category": category,
+        "active_offers": active_offers,
+        "signals": signals[:3],
+        "customer_aggregate": merchant_payload.get("customer_aggregate", {}),
+    }
+
     return (
         f"Turn number: {turn_number}\n"
         f"Reply text: \"{reply_text}\"\n"
         f"Original Vera message: \"{original_message}\"\n"
         f"Original CTA: \"{original_cta}\"\n"
         f"Category: {category}\n"
-        f"Merchant: {json.dumps(merchant_payload)}\n"
+        f"Merchant summary: {json.dumps(merchant_summary)}\n"
+        f"Trigger context: {json.dumps(trigger_summary)}\n"
+        f"Relevant digest item: {json.dumps(digest_item)}\n"
         f"Conversation history (last 5 turns): {json.dumps(conversation_history)}\n"
-        f"Recent messages from merchant/customer: {json.dumps(recent_from_role)}\n"
+        f"Recent messages from merchant: {json.dumps(recent_from_role)}\n"
         f"Tick history: {json.dumps(history_summary)}"
     )
