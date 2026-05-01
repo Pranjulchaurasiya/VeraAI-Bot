@@ -1,16 +1,9 @@
 """
 agent.py — 3-step agentic pipeline for Vera Bot
-Step 1: Signal Ranker + Synthesizer  (llama-3.1-8b-instant, ~1s)
-Step 2: Composer with escalation     (llama-3.3-70b-versatile, ~5s)
-Step 3: Critic & self-correct        (llama-3.1-8b-instant, ~1s)
+Step 1: Signal Ranker     (llama-3.1-8b-instant, ~1s)
+Step 2: Composer          (llama-3.3-70b-versatile, ~5s)
+Step 3: Critic            (llama-3.1-8b-instant, ~1s)
 Total: ~7s | Budget: 25s | Buffer: ~18s
-
-Upgrades:
-- Tick history passed to Step 1 + Step 2 for escalation
-- Signal synthesis (perfect storm detection)
-- 70b model for replies (replay test quality)
-- Parallel context fetch + Step 1 via threading
-- Tighter fallback chain
 """
 
 import json
@@ -26,11 +19,10 @@ from prompts import (
     CRITIC_SYSTEM, critic_user,
     REPLY_COMPOSER_SYSTEM, reply_composer_user,
 )
-from categories import get_category_rules
 
 logger = logging.getLogger(__name__)
 
-# ── Groq client (lazy init) ───────────────────────────────────────
+# ── Groq client (lazy, thread-safe) ──────────────────────────────
 _client = None
 _client_lock = threading.Lock()
 
@@ -39,19 +31,17 @@ def get_client() -> Groq:
     global _client
     if _client is None:
         with _client_lock:
-            if _client is None:  # double-checked locking
+            if _client is None:
                 api_key = os.environ.get("GROQ_API_KEY", "")
                 if not api_key:
-                    raise RuntimeError("GROQ_API_KEY environment variable is not set")
-                _client = Groq(api_key=api_key )
+                    raise RuntimeError("GROQ_API_KEY not set")
+                _client = Groq(api_key=api_key)
     return _client
 
 
 MODEL_FAST = "llama-3.1-8b-instant"
 MODEL_STRONG = "llama-3.3-70b-versatile"
-
-STEP2_TIMEOUT = 12      # seconds — if exceeded, log warning
-PIPELINE_HARD_LIMIT = 22  # seconds — skip Step 3 if exceeded
+PIPELINE_HARD_LIMIT = 22  # skip Step 3 if exceeded
 
 
 # ── Core Groq call ────────────────────────────────────────────────
@@ -61,11 +51,8 @@ def call_groq(
     user_prompt: str,
     model: str = MODEL_FAST,
     temperature: float = 0.3,
-    max_tokens: int = 500,
+    max_tokens: int = 600,
 ) -> dict:
-    """
-    Core Groq API call with JSON mode. Raises on failure.
-    """
     response = get_client().chat.completions.create(
         model=model,
         messages=[
@@ -76,8 +63,7 @@ def call_groq(
         response_format={"type": "json_object"},
         max_tokens=max_tokens,
     )
-    raw = response.choices[0].message.content
-    return json.loads(raw)
+    return json.loads(response.choices[0].message.content)
 
 
 def call_groq_with_retry(
@@ -86,52 +72,42 @@ def call_groq_with_retry(
     model: str = MODEL_FAST,
     fallback_model: str = MODEL_FAST,
     temperature: float = 0.3,
-    max_tokens: int = 500,
+    max_tokens: int = 600,
 ) -> dict:
-    """
-    Call Groq with one automatic retry on a different model.
-    """
     try:
         return call_groq(system_prompt, user_prompt, model, temperature, max_tokens)
     except Exception as e:
-        logger.warning(f"Groq call failed ({model}): {e} — retrying with {fallback_model}")
+        logger.warning(f"Groq ({model}) failed: {e} — retrying with {fallback_model}")
         try:
             return call_groq(system_prompt, user_prompt, fallback_model, temperature, max_tokens)
         except Exception as e2:
-            logger.error(f"Groq retry also failed ({fallback_model}): {e2}")
+            logger.error(f"Groq retry ({fallback_model}) failed: {e2}")
             raise
 
 
-# ── Step 1: Signal Rank + Synthesis ──────────────────────────────
+# ── Step 1: Signal Rank ───────────────────────────────────────────
 
 def step1_signal_rank(merged_context: dict, tick_history: list) -> dict:
-    """
-    Analyze signals, pick strongest, detect perfect storms, flag escalation.
-    Uses llama-3.1-8b-instant (~1s).
-    """
     user_prompt = signal_ranker_user(merged_context, tick_history)
     try:
         result = call_groq_with_retry(
-            SIGNAL_RANKER_SYSTEM,
-            user_prompt,
-            model=MODEL_FAST,
-            fallback_model=MODEL_FAST,
+            SIGNAL_RANKER_SYSTEM, user_prompt,
+            model=MODEL_FAST, fallback_model=MODEL_FAST,
             max_tokens=400,
         )
     except Exception as e:
-        logger.error(f"Step1 Groq failed: {e} — using fallback signal")
+        logger.error(f"Step1 failed: {e}")
         result = {}
 
     result.setdefault("top_signal", "general_opportunity")
-    result.setdefault("signal_type", "streak")
     result.setdefault("key_number", "N/A")
     result.setdefault("key_fact", "merchant on magicpin")
     result.setdefault("reasoning", "Opportunity to engage merchant now")
     result.setdefault("is_perfect_storm", False)
     result.setdefault("storm_narrative", "")
     result.setdefault("escalation_needed", False)
-    result.setdefault("escalation_reason", "")
-    result.setdefault("suggested_angle", "")
+    result.setdefault("send_as", "vera")
+    result.setdefault("is_customer_facing", False)
     return result
 
 
@@ -141,21 +117,17 @@ def step2_compose(
     step1_output: dict,
     merchant_payload: dict,
     trigger_payload: dict,
+    category_payload: dict,
     category: str,
-    category_rules: dict,
     tick_history: list,
     customer_payload: dict | None = None,
 ) -> dict:
-    """
-    Compose the merchant message with escalation + storm awareness.
-    Uses llama-3.3-70b-versatile (~5s), falls back to 8b.
-    """
     user_prompt = composer_user(
         step1_output=step1_output,
         merchant_payload=merchant_payload,
         trigger_payload=trigger_payload,
+        category_payload=category_payload,
         category=category,
-        category_tone=category_rules["tone_instruction"],
         tick_history=tick_history,
         customer_payload=customer_payload,
     )
@@ -165,67 +137,56 @@ def step2_compose(
 
     try:
         result = call_groq_with_retry(
-            COMPOSER_SYSTEM,
-            user_prompt,
-            model=MODEL_STRONG,
-            fallback_model=MODEL_FAST,
-            temperature=0.4,
-            max_tokens=500,
+            COMPOSER_SYSTEM, user_prompt,
+            model=MODEL_STRONG, fallback_model=MODEL_FAST,
+            temperature=0.4, max_tokens=700,
         )
     except Exception as e1:
-        logger.warning(f"Step2 all retries failed: {e1} — trying 8b direct")
+        logger.warning(f"Step2 retries failed: {e1} — trying 8b direct")
         try:
-            result = call_groq(
-                COMPOSER_SYSTEM,
-                user_prompt,
-                model=MODEL_FAST,
-                temperature=0.4,
-                max_tokens=500,
-            )
+            result = call_groq(COMPOSER_SYSTEM, user_prompt, model=MODEL_FAST, temperature=0.4, max_tokens=700)
         except Exception as e2:
-            logger.error(f"Step2 complete failure: {e2} — using static fallback")
+            logger.error(f"Step2 complete failure: {e2}")
             result = None
 
     elapsed = time.time() - t0
-    if elapsed > STEP2_TIMEOUT:
-        logger.warning(f"Step2 took {elapsed:.1f}s — over {STEP2_TIMEOUT}s budget")
+    if elapsed > 12:
+        logger.warning(f"Step2 took {elapsed:.1f}s")
 
     if result is None:
         result = {}
 
+    # Determine send_as from step1 or customer context
+    default_send_as = "merchant_on_behalf" if (customer_payload or step1_output.get("is_customer_facing")) else "vera"
     result.setdefault("message", "Vera is here to help grow your business!")
-    result.setdefault("cta", "Reply YES to proceed")
-    result.setdefault("send_as", "vera")
+    result.setdefault("cta", "open_ended")
+    result.setdefault("send_as", default_send_as)
+    result.setdefault("template_name", f"vera_{trigger_payload.get('kind', 'generic')}_v1")
+    result.setdefault("template_params", [])
     result.setdefault("rationale", "Signal-based outreach")
-    result["send_as"] = "vera"
     return result
 
 
 # ── Step 3: Critic ────────────────────────────────────────────────
 
 def step3_critic(step2_output: dict, original_context: dict) -> dict:
-    """
-    Score on 5 dimensions, rewrite if any < 7.
-    Uses llama-3.1-8b-instant (~1s).
-    """
     user_prompt = critic_user(step2_output, original_context)
     try:
         result = call_groq_with_retry(
-            CRITIC_SYSTEM,
-            user_prompt,
-            model=MODEL_FAST,
-            fallback_model=MODEL_FAST,
-            max_tokens=600,
+            CRITIC_SYSTEM, user_prompt,
+            model=MODEL_FAST, fallback_model=MODEL_FAST,
+            max_tokens=700,
         )
     except Exception as e:
-        logger.error(f"Step3 failed: {e} — returning Step2 output")
+        logger.error(f"Step3 failed: {e} — returning Step2")
         return step2_output
 
     result.setdefault("message", step2_output.get("message", ""))
     result.setdefault("cta", step2_output.get("cta", ""))
-    result.setdefault("send_as", "vera")
+    result.setdefault("send_as", step2_output.get("send_as", "vera"))
+    result.setdefault("template_name", step2_output.get("template_name", ""))
+    result.setdefault("template_params", step2_output.get("template_params", []))
     result.setdefault("rationale", step2_output.get("rationale", ""))
-    result["send_as"] = "vera"
     return result
 
 
@@ -236,44 +197,30 @@ def run_pipeline(
     trigger_id: str,
     merchant_payload: dict,
     trigger_payload: dict,
+    category_payload: dict,
     customer_payload: dict | None,
     category: str,
     tick_history: list,
 ) -> dict:
-    """
-    Full 3-step agentic pipeline with escalation + signal synthesis.
-    Returns final composed + critiqued message dict.
-    """
     pipeline_start = time.time()
-    category_rules = get_category_rules(category)
-
-    # Flatten nested judge payload structure: {identity:{}, performance:{}, offers:[]}
-    # into a single dict so prompts can reference any field directly
-    def flatten_payload(p: dict) -> dict:
-        flat = {}
-        for k, v in p.items():
-            if isinstance(v, dict):
-                flat.update(v)       # hoist nested keys to top level
-                flat[k] = v          # also keep original nested key
-            else:
-                flat[k] = v
-        return flat
-
-    merchant_flat = flatten_payload(merchant_payload)
-    trigger_flat = flatten_payload(trigger_payload)
-    customer_flat = flatten_payload(customer_payload) if customer_payload else {}
 
     merged_context = {
         "merchant_id": merchant_id,
         "trigger_id": trigger_id,
         "category": category,
-        "merchant": merchant_flat,
-        "trigger": trigger_flat,
-        "customer": customer_flat,
+        "merchant": merchant_payload,
+        "trigger": trigger_payload,
+        "customer": customer_payload or {},
+        "category_context": {
+            "peer_stats": category_payload.get("peer_stats", {}),
+            "seasonal_beats": category_payload.get("seasonal_beats", []),
+            "trend_signals": category_payload.get("trend_signals", [])[:3],
+            "voice_tone": category_payload.get("voice", {}).get("tone", ""),
+        },
         "tick_count": len(tick_history),
     }
 
-    # ── STEP 1: Signal Rank ──────────────────────────────────────
+    # ── Step 1 ───────────────────────────────────────────────────
     t1 = time.time()
     step1_result = step1_signal_rank(merged_context, tick_history)
     logger.info(
@@ -283,38 +230,38 @@ def run_pipeline(
         f"escalate={step1_result.get('escalation_needed')}"
     )
 
-    # ── STEP 2: Compose ──────────────────────────────────────────
+    # ── Step 2 ───────────────────────────────────────────────────
     t2 = time.time()
     try:
         step2_result = step2_compose(
             step1_output=step1_result,
             merchant_payload=merchant_payload,
             trigger_payload=trigger_payload,
+            category_payload=category_payload,
             category=category,
-            category_rules=category_rules,
             tick_history=tick_history,
             customer_payload=customer_payload,
         )
         logger.info(f"[{merchant_id}] Step2 {time.time()-t2:.2f}s")
     except Exception as e:
         logger.error(f"[{merchant_id}] Step2 exception: {e}")
+        owner = (merchant_payload.get("identity") or {}).get("owner_first_name", "")
         step2_result = {
-            "message": (
-                f"Your {category} business has a strong opportunity right now. "
-                f"Want me to help you act on it?"
-            ),
-            "cta": "Reply YES to proceed",
+            "message": f"{owner + ', ' if owner else ''}there's a strong opportunity for your {category} business right now. Want me to help you act on it?",
+            "cta": "open_ended",
             "send_as": "vera",
+            "template_name": "vera_generic_v1",
+            "template_params": [],
             "rationale": "Fallback — Groq unavailable",
         }
 
-    # ── Check time before Step 3 ─────────────────────────────────
+    # ── Time check ───────────────────────────────────────────────
     elapsed = time.time() - pipeline_start
     if elapsed > PIPELINE_HARD_LIMIT:
-        logger.warning(f"[{merchant_id}] Pipeline {elapsed:.1f}s > {PIPELINE_HARD_LIMIT}s — skipping Step3")
+        logger.warning(f"[{merchant_id}] Pipeline {elapsed:.1f}s > limit — skipping Step3")
         return step2_result
 
-    # ── STEP 3: Critic ───────────────────────────────────────────
+    # ── Step 3 ───────────────────────────────────────────────────
     t3 = time.time()
     final_result = step3_critic(step2_result, merged_context)
     logger.info(
@@ -322,11 +269,10 @@ def run_pipeline(
         f"passed={final_result.get('passed', '?')} | "
         f"total={time.time()-pipeline_start:.2f}s"
     )
-
     return final_result
 
 
-# ── Reply Pipeline (70b for quality) ─────────────────────────────
+# ── Reply Pipeline (70b) ──────────────────────────────────────────
 
 def run_reply_pipeline(
     reply_text: str,
@@ -336,11 +282,8 @@ def run_reply_pipeline(
     category: str,
     merchant_payload: dict,
     tick_history: list,
+    turn_number: int = 1,
 ) -> dict:
-    """
-    Reply pipeline using 70b model for replay test quality.
-    Handles all 5 reply cases with full tick history context.
-    """
     user_prompt = reply_composer_user(
         reply_text=reply_text,
         conversation_history=conversation_history,
@@ -349,30 +292,31 @@ def run_reply_pipeline(
         category=category,
         merchant_payload=merchant_payload,
         tick_history=tick_history,
+        turn_number=turn_number,
     )
 
     try:
-        # Use 70b for replies — this is the replay test tiebreaker
         result = call_groq_with_retry(
-            REPLY_COMPOSER_SYSTEM,
-            user_prompt,
-            model=MODEL_STRONG,
-            fallback_model=MODEL_FAST,
-            temperature=0.3,
-            max_tokens=400,
+            REPLY_COMPOSER_SYSTEM, user_prompt,
+            model=MODEL_STRONG, fallback_model=MODEL_FAST,
+            temperature=0.3, max_tokens=400,
         )
     except Exception as e:
         logger.error(f"Reply pipeline failed: {e}")
         result = {
-            "message": "Thanks for your reply! Let me know how I can help you further.",
+            "message": "Thanks for your reply! Let me know how I can help.",
             "cta": "",
             "send_as": "vera",
+            "action": "send",
+            "wait_seconds": 0,
             "rationale": "Fallback reply",
             "suppress": False,
             "case_detected": "unknown",
             "mark_acted": False,
         }
 
+    result.setdefault("action", "send")
+    result.setdefault("wait_seconds", 0)
     result.setdefault("suppress", False)
     result.setdefault("case_detected", "unknown")
     result.setdefault("send_as", "vera")
