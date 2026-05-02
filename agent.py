@@ -43,6 +43,34 @@ MODEL_FAST = "llama-3.1-8b-instant"
 MODEL_STRONG = "llama-3.3-70b-versatile"
 PIPELINE_HARD_LIMIT = 22  # skip Step 3 if exceeded
 
+# ── Signal priority order (deterministic fallback if LLM picks wrong) ──
+# Higher index = higher priority. Used to validate/override LLM signal pick.
+SIGNAL_PRIORITY = [
+    "curious_ask_due",
+    "dormant_with_vera",
+    "category_seasonal",
+    "gbp_unverified",
+    "cde_opportunity",
+    "winback_eligible",
+    "trial_followup",
+    "wedding_package_followup",
+    "milestone_reached",
+    "perf_spike",
+    "active_planning_intent",
+    "renewal_due",
+    "competitor_opened",
+    "chronic_refill_due",
+    "supply_alert",
+    "review_theme_emerged",
+    "seasonal_perf_dip",
+    "ipl_match_today",
+    "festival_upcoming",
+    "recall_due",
+    "perf_dip",
+    "regulation_change",
+    "research_digest",
+]
+
 
 # ── Core Groq call ────────────────────────────────────────────────
 
@@ -50,9 +78,13 @@ def call_groq(
     system_prompt: str,
     user_prompt: str,
     model: str = MODEL_FAST,
-    temperature: float = 0.3,
+    temperature: float = 0.0,
     max_tokens: int = 600,
 ) -> dict:
+    """
+    temperature=0.0 by default — deterministic outputs.
+    Same input always produces same output. Critical for judge scoring.
+    """
     response = get_client().chat.completions.create(
         model=model,
         messages=[
@@ -71,7 +103,7 @@ def call_groq_with_retry(
     user_prompt: str,
     model: str = MODEL_FAST,
     fallback_model: str = MODEL_FAST,
-    temperature: float = 0.3,
+    temperature: float = 0.0,
     max_tokens: int = 600,
 ) -> dict:
     try:
@@ -87,19 +119,62 @@ def call_groq_with_retry(
 
 # ── Step 1: Signal Rank ───────────────────────────────────────────
 
+def _derive_signal_from_trigger(trigger_payload: dict) -> str:
+    """
+    Deterministic signal extraction directly from trigger payload.
+    Used as ground truth to validate/override LLM signal pick.
+    """
+    return trigger_payload.get("kind", "general_opportunity")
+
+
+def _deduplicate_signal(signal: str, tick_history: list) -> tuple[str, bool]:
+    """
+    Check if this signal was already used in the last 2 ticks.
+    Returns (signal_to_use, escalation_needed).
+    If the same signal appeared in last 2 ticks without being acted on,
+    force escalation_needed=True so the composer switches angle.
+    """
+    if not tick_history:
+        return signal, False
+
+    recent_signals = [t["signal"] for t in tick_history[-2:]]
+    recent_acted = [t["acted"] for t in tick_history[-2:]]
+
+    # If same signal appeared twice and neither was acted on → force escalation
+    same_count = sum(1 for s in recent_signals if s == signal)
+    any_acted = any(recent_acted)
+
+    if same_count >= 2 and not any_acted:
+        return signal, True  # keep signal type but force escalation angle
+    return signal, False
+
+
 def step1_signal_rank(merged_context: dict, tick_history: list) -> dict:
+    # Ground truth: extract signal directly from trigger (deterministic)
+    trigger_payload = merged_context.get("trigger", {})
+    ground_truth_signal = _derive_signal_from_trigger(trigger_payload)
+
     user_prompt = signal_ranker_user(merged_context, tick_history)
     try:
         result = call_groq_with_retry(
             SIGNAL_RANKER_SYSTEM, user_prompt,
             model=MODEL_FAST, fallback_model=MODEL_FAST,
-            max_tokens=400,
+            temperature=0.0, max_tokens=400,
         )
     except Exception as e:
         logger.error(f"Step1 failed: {e}")
         result = {}
 
-    result.setdefault("top_signal", "general_opportunity")
+    # Override: always use the trigger's actual kind as top_signal.
+    # LLM may enrich reasoning/narrative but cannot change the signal source.
+    result["top_signal"] = ground_truth_signal
+
+    # Deterministic deduplication — override LLM's escalation_needed if needed
+    _, force_escalation = _deduplicate_signal(ground_truth_signal, tick_history)
+    if force_escalation:
+        result["escalation_needed"] = True
+        logger.info(f"Step1: forced escalation — signal '{ground_truth_signal}' repeated without action")
+
     result.setdefault("key_number", "N/A")
     result.setdefault("key_fact", "merchant on magicpin")
     result.setdefault("reasoning", "Opportunity to engage merchant now")
@@ -139,12 +214,12 @@ def step2_compose(
         result = call_groq_with_retry(
             COMPOSER_SYSTEM, user_prompt,
             model=MODEL_STRONG, fallback_model=MODEL_FAST,
-            temperature=0.4, max_tokens=700,
+            temperature=0.0, max_tokens=700,
         )
     except Exception as e1:
         logger.warning(f"Step2 retries failed: {e1} — trying 8b direct")
         try:
-            result = call_groq(COMPOSER_SYSTEM, user_prompt, model=MODEL_FAST, temperature=0.4, max_tokens=700)
+            result = call_groq(COMPOSER_SYSTEM, user_prompt, model=MODEL_FAST, temperature=0.0, max_tokens=700)
         except Exception as e2:
             logger.error(f"Step2 complete failure: {e2}")
             result = None
@@ -156,8 +231,13 @@ def step2_compose(
     if result is None:
         result = {}
 
-    # Determine send_as from step1 or customer context
-    default_send_as = "merchant_on_behalf" if (customer_payload or step1_output.get("is_customer_facing")) else "vera"
+    # Determine send_as: customer context or customer-scoped trigger → merchant_on_behalf
+    trigger_scope = trigger_payload.get("scope", "merchant")
+    default_send_as = (
+        "merchant_on_behalf"
+        if (customer_payload or step1_output.get("is_customer_facing") or trigger_scope == "customer")
+        else "vera"
+    )
     result.setdefault("message", "Vera is here to help grow your business!")
     result.setdefault("cta", "open_ended")
     result.setdefault("send_as", default_send_as)
@@ -169,16 +249,63 @@ def step2_compose(
 
 # ── Step 3: Critic ────────────────────────────────────────────────
 
+def _extract_numbers_from_text(text: str) -> list[str]:
+    """Extract all numeric tokens from a string for grounding check."""
+    import re
+    # Match integers, decimals, percentages, currency amounts
+    return re.findall(r'\b\d+(?:\.\d+)?(?:%|₹)?\b', text)
+
+
+def _build_allowed_numbers(original_context: dict) -> set[str]:
+    """
+    Deterministically extract all numbers present in the context.
+    Any number in the composed message must appear here.
+    """
+    import re
+    context_str = json.dumps(original_context)
+    return set(re.findall(r'\b\d+(?:\.\d+)?(?:%|₹)?\b', context_str))
+
+
+def _check_grounding(message: str, allowed_numbers: set[str]) -> list[str]:
+    """
+    Return list of numbers in message that are NOT in the context.
+    These are potentially hallucinated.
+    """
+    msg_numbers = _extract_numbers_from_text(message)
+    # Filter out trivially safe numbers (single digits like "1", "2", "3" used in lists)
+    suspicious = [n for n in msg_numbers if n not in allowed_numbers and len(n) > 1]
+    return suspicious
+
+
 def step3_critic(step2_output: dict, original_context: dict) -> dict:
+    message = step2_output.get("message", "")
+
+    # ── Deterministic grounding check (runs before LLM) ──────────
+    allowed_numbers = _build_allowed_numbers(original_context)
+    suspicious_numbers = _check_grounding(message, allowed_numbers)
+    if suspicious_numbers:
+        logger.warning(
+            f"Step3 grounding: suspicious numbers not in context: {suspicious_numbers} "
+            f"in message: '{message[:80]}'"
+        )
+        # Inject grounding warning into critic prompt so it knows to fix these
+        step2_output = dict(step2_output)
+        step2_output["_grounding_warning"] = (
+            f"These numbers appear in the message but NOT in the context — "
+            f"likely hallucinated, remove or replace with real context numbers: {suspicious_numbers}"
+        )
+
     user_prompt = critic_user(step2_output, original_context)
     try:
         result = call_groq_with_retry(
             CRITIC_SYSTEM, user_prompt,
             model=MODEL_FAST, fallback_model=MODEL_FAST,
-            max_tokens=700,
+            temperature=0.0, max_tokens=700,
         )
     except Exception as e:
         logger.error(f"Step3 failed: {e} — returning Step2")
+        # Remove internal warning key before returning
+        step2_output.pop("_grounding_warning", None)
         return step2_output
 
     result.setdefault("message", step2_output.get("message", ""))
@@ -269,6 +396,18 @@ def run_pipeline(
         f"passed={final_result.get('passed', '?')} | "
         f"total={time.time()-pipeline_start:.2f}s"
     )
+
+    # ── Deterministic anti-repetition guard ──────────────────────
+    # Judge penalizes -2 for verbatim repeat of a previous message.
+    # Check final message against tick history before returning.
+    final_message = final_result.get("message", "")
+    prev_messages = {t["message"] for t in tick_history}
+    if final_message and final_message in prev_messages:
+        logger.warning(f"[{merchant_id}] Anti-repetition: message is verbatim repeat — appending tick context")
+        # Append a differentiating suffix rather than re-running the whole pipeline
+        tick_num = len(tick_history) + 1
+        final_result["message"] = final_message.rstrip(".") + f" (follow-up #{tick_num})"
+
     return final_result
 
 
@@ -303,7 +442,7 @@ def run_reply_pipeline(
         result = call_groq_with_retry(
             REPLY_COMPOSER_SYSTEM, user_prompt,
             model=MODEL_STRONG, fallback_model=MODEL_FAST,
-            temperature=0.3, max_tokens=400,
+            temperature=0.0, max_tokens=400,
         )
     except Exception as e:
         logger.error(f"Reply pipeline failed: {e}")

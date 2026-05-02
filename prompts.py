@@ -106,13 +106,15 @@ Compose ONE message that scores 10/10 on all 5 judge dimensions.
    - SINGLE BINARY CTA: Reply YES / STOP — not multi-choice (except booking slots)
 
 ═══ HARD RULES ═══
-- NEVER fabricate numbers not in the context
+- NEVER fabricate numbers not in the context — if a number isn't in the input, don't use it
 - NEVER start with "Hi" or "Hello" — start with the fact or hook
 - Under 100 words for merchant-facing
 - Exactly ONE CTA
 - No URLs in message body (Meta rejects them — -3 penalty)
 - send_as = "vera" for merchant-facing, "merchant_on_behalf" for customer-facing
 - For customer-facing: use customer's name, honor language pref, no medical claims
+- Every number in your message MUST be traceable to a field in the input context
+- If no specific number is available, use qualitative language instead of inventing one
 
 ═══ ACTIVE PLANNING INTENT — CRITICAL RULE ═══
 If trigger kind is "active_planning_intent": merchant already said YES.

@@ -124,7 +124,7 @@ def preload_dataset():
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 slug = data.get("slug", f.stem)
-                stored, _ = store_context("category", slug, 1, data)
+                stored, _ = store_context("category", slug, 0, data)  # v0 = always overridable
                 if stored:
                     loaded += 1
             except Exception as e:
@@ -138,7 +138,7 @@ def preload_dataset():
             for merchant in data.get("merchants", []):
                 mid = merchant.get("merchant_id")
                 if mid:
-                    stored, _ = store_context("merchant", mid, 1, merchant)
+                    stored, _ = store_context("merchant", mid, 0, merchant)  # v0 = always overridable
                     if stored:
                         loaded += 1
         except Exception as e:
@@ -152,7 +152,7 @@ def preload_dataset():
             for customer in data.get("customers", []):
                 cid = customer.get("customer_id")
                 if cid:
-                    stored, _ = store_context("customer", cid, 1, customer)
+                    stored, _ = store_context("customer", cid, 0, customer)  # v0 = always overridable
                     if stored:
                         loaded += 1
         except Exception as e:
@@ -166,7 +166,7 @@ def preload_dataset():
             for trigger in data.get("triggers", []):
                 tid = trigger.get("id")
                 if tid:
-                    stored, _ = store_context("trigger", tid, 1, trigger)
+                    stored, _ = store_context("trigger", tid, 0, trigger)  # v0 = always overridable
                     if stored:
                         loaded += 1
         except Exception as e:
@@ -449,17 +449,22 @@ def reply():
 
         # ── Auto-reply detection (fast path — no LLM needed) ──────
         if is_auto_reply(message_text):
+            # Count auto-replies in this conversation using stored turns
             all_turns = get_all_turns(conversation_id)
-            merchant_turns = [t["content"] for t in all_turns if t.get("role") == from_role]
+            # Include the current message (already stored above) in the count
+            auto_reply_count = sum(
+                1 for t in all_turns
+                if t.get("role") == from_role and is_auto_reply(t.get("content", ""))
+            )
 
-            if turn_number >= 4 or len(merchant_turns) >= 3:
+            if auto_reply_count >= 3 or turn_number >= 4:
                 # 3+ auto-replies → end
                 logger.info(f"Auto-reply x3 detected at turn {turn_number} — ending")
                 return jsonify({
                     "action": "end",
                     "rationale": "Auto-reply detected 3+ times — owner not at phone. Closing conversation.",
                 }), 200
-            elif turn_number >= 3 or len(merchant_turns) >= 2:
+            elif auto_reply_count >= 2 or turn_number >= 3:
                 # 2nd auto-reply → wait 4 hours
                 logger.info(f"Auto-reply x2 at turn {turn_number} — waiting 4h")
                 return jsonify({
@@ -604,10 +609,8 @@ def teardown():
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
-        "bot": "Vera Bot by Pranjul Chaurasiya",
-        "challenge": "magicpin India AI Challenge 2026",
-        "version": "4.0.0",
-        "endpoints": ["/v1/healthz", "/v1/metadata", "/v1/context", "/v1/tick", "/v1/reply"],
+        "message": "Vera Bot running",
+        "docs": "https://github.com/Pranjulchaurasiya/VeraAI-Bot",
     }), 200
 
 

@@ -192,6 +192,19 @@ def get_ignored_streak(merchant_id: str) -> int:
         return streak
 
 
+def get_used_signals(merchant_id: str) -> dict[str, int]:
+    """
+    Return a count of how many times each signal was used for this merchant.
+    Used for deterministic deduplication — prevents repeating the same angle.
+    """
+    with _tick_history_lock:
+        counts: dict[str, int] = {}
+        for record in tick_history[merchant_id]:
+            sig = record.get("signal", "")
+            counts[sig] = counts.get(sig, 0) + 1
+        return counts
+
+
 # ── Tick-to-Merchant Map ──────────────────────────────────────────
 
 def register_tick(
