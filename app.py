@@ -629,8 +629,27 @@ def payload_too_large(e):
 
 # ── Startup ───────────────────────────────────────────────────────
 
+def _keep_alive():
+    """Ping self every 4 minutes to prevent Railway cold-start sleep."""
+    import urllib.request
+    import threading
+
+    def ping():
+        while True:
+            try:
+                port = int(os.environ.get("PORT", 5000))
+                urllib.request.urlopen(f"http://localhost:{port}/v1/healthz", timeout=5)
+            except Exception:
+                pass
+            time.sleep(240)  # 4 minutes
+
+    t = threading.Thread(target=ping, daemon=True)
+    t.start()
+
+
 with app.app_context():
     preload_dataset()
+    _keep_alive()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
